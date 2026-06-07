@@ -9,6 +9,7 @@ import { createLogger } from "./logger";
 import type { ModelStore } from "./modelStore";
 import { TaskStore, type CodeChangePolicy, type TaskIntent } from "./taskStore";
 import { splitMessageByLength, truncateText } from "./text";
+import type { WorkspaceStore } from "./workspaceStore";
 import type { Telegraf, Context } from "telegraf";
 
 const logger = createLogger("messageHandler");
@@ -25,17 +26,26 @@ export function registerMessageHandler(
   codexRunner: CodexRunner,
   botUsername: string | undefined,
   modelStore: ModelStore,
+  workspaceStore: WorkspaceStore,
 ): void {
   bot.on(message("text"), async (ctx) => {
-    await handleTextMessage(ctx as BotContext, config, taskStore, codexRunner, botUsername, modelStore);
+    await handleTextMessage(
+      ctx as BotContext,
+      config,
+      taskStore,
+      codexRunner,
+      botUsername,
+      modelStore,
+      workspaceStore,
+    );
   });
 
   // 文档 / 图片附件：下载到本机后把本地路径交给 codex 读取
   bot.on(message("document"), async (ctx) => {
-    await handleAttachmentMessage(ctx, config, taskStore, codexRunner, botUsername, modelStore);
+    await handleAttachmentMessage(ctx, config, taskStore, codexRunner, botUsername, modelStore, workspaceStore);
   });
   bot.on(message("photo"), async (ctx) => {
-    await handleAttachmentMessage(ctx, config, taskStore, codexRunner, botUsername, modelStore);
+    await handleAttachmentMessage(ctx, config, taskStore, codexRunner, botUsername, modelStore, workspaceStore);
   });
 }
 
@@ -46,6 +56,7 @@ async function handleTextMessage(
   codexRunner: CodexRunner,
   botUsername: string | undefined,
   modelStore: ModelStore,
+  workspaceStore: WorkspaceStore,
 ): Promise<void> {
   const text = ctx.message.text.trim();
   const chatType = ctx.chat?.type ?? "unknown";
@@ -86,7 +97,7 @@ async function handleTextMessage(
   }
 
   if (intent.kind === "status") {
-    await replyLongMessage(ctx, await buildStatusReply(config, taskStore));
+    await replyLongMessage(ctx, await buildStatusReply(config, taskStore, workspaceStore.get(chatId, config.codexWorkspaceDir)));
     return;
   }
 
@@ -114,6 +125,7 @@ async function handleTextMessage(
       username,
       chatId,
       chatType,
+      workspaceDir: workspaceStore.get(chatId, config.codexWorkspaceDir),
       relatedTaskId: recentTask.id,
       recentTaskContent: await taskStore.getLatestTaskContent(chatId),
     });
@@ -125,6 +137,7 @@ async function handleTextMessage(
     username,
     chatId,
     chatType,
+    workspaceDir: workspaceStore.get(chatId, config.codexWorkspaceDir),
     relatedTaskId: undefined,
     recentTaskContent: undefined,
   });
@@ -142,6 +155,7 @@ async function handleTaskIntent(
     username: string;
     chatId: string;
     chatType: string;
+    workspaceDir: string;
     relatedTaskId?: string;
     recentTaskContent?: string | null;
   },
@@ -197,7 +211,13 @@ async function handleTaskIntent(
 
   try {
     const model = modelStore.get(context.chatId, config.codexModel);
-    const result = await codexRunner.runTask(task, intent, context.recentTaskContent, model);
+    const result = await codexRunner.runTask(
+      task,
+      intent,
+      context.recentTaskContent,
+      model,
+      context.workspaceDir,
+    );
     task.status = result.ok ? "completed" : "failed";
     task.logPrefix = result.logPrefix;
     task.executionNotes = result.summary;
@@ -239,6 +259,7 @@ async function handleAttachmentMessage(
   codexRunner: CodexRunner,
   botUsername: string | undefined,
   modelStore: ModelStore,
+  workspaceStore: WorkspaceStore,
 ): Promise<void> {
   const msg = ctx.message as
     | {
@@ -322,6 +343,7 @@ async function handleAttachmentMessage(
     username,
     chatId,
     chatType,
+    workspaceDir: workspaceStore.get(chatId, config.codexWorkspaceDir),
     relatedTaskId: undefined,
     recentTaskContent: undefined,
   });
@@ -360,15 +382,19 @@ function buildAttachmentIntent(
   };
 }
 
-async function buildStatusReply(config: AppConfig, taskStore: TaskStore): Promise<string> {
+async function buildStatusReply(
+  config: AppConfig,
+  taskStore: TaskStore,
+  workspaceDir: string,
+): Promise<string> {
   const taskCount = await taskStore.countTasks();
   const latestTask = await taskStore.getLatestTask();
-  const workspaceExists = await pathExists(config.codexWorkspaceDir);
+  const workspaceExists = await pathExists(workspaceDir);
 
   return [
     "Agent 状态：运行中",
     `RUN_CODEX_ENABLED：${String(config.runCodexEnabled)}`,
-    `CODEX_WORKSPACE_DIR：${config.codexWorkspaceDir}`,
+    `当前工作目录：${workspaceDir}`,
     `工作目录存在：${workspaceExists ? "是" : "否"}`,
     `当前任务数量：${taskCount}`,
     latestTask

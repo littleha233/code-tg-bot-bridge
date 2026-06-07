@@ -26,13 +26,15 @@ export class CodexRunner {
     intent: ParsedIntent,
     recentTaskContent?: string | null,
     model?: string,
+    workspaceDirArg?: string,
   ): Promise<CodexRunResult> {
-    const workspaceExists = await pathExists(this.config.codexWorkspaceDir);
+    const workspaceDir = workspaceDirArg || this.config.codexWorkspaceDir;
+    const workspaceExists = await pathExists(workspaceDir);
     if (!workspaceExists) {
-      throw new Error(`CODEX_WORKSPACE_DIR does not exist: ${this.config.codexWorkspaceDir}`);
+      throw new Error(`工作目录不存在：${workspaceDir}`);
     }
 
-    const prompt = buildCodexPrompt(intent, task, this.config.codexWorkspaceDir, recentTaskContent);
+    const prompt = buildCodexPrompt(intent, task, workspaceDir, recentTaskContent);
     const logPrefix = `${task.id}-${Date.now()}`;
     const promptLogPath = path.join(this.config.logsDir, `${logPrefix}.prompt.md`);
     const stdoutLogPath = path.join(this.config.logsDir, `${logPrefix}.stdout.log`);
@@ -42,7 +44,7 @@ export class CodexRunner {
 
     logger.info("Running codex exec", {
       taskId: task.id,
-      workspace: this.config.codexWorkspaceDir,
+      workspace: workspaceDir,
       mode: intent.kind,
       codeChangePolicy: intent.codeChangePolicy,
       model: model ?? "(codex 默认)",
@@ -51,7 +53,7 @@ export class CodexRunner {
     // 指定了模型就传 -m，否则用 codex 自身的默认模型
     const execArgs = ["exec", "--skip-git-repo-check", ...(model ? ["--model", model] : []), "-"];
     const result = await execa(this.config.codexBin, execArgs, {
-      cwd: this.config.codexWorkspaceDir,
+      cwd: workspaceDir,
       timeout: this.config.codexTimeoutMs,
       reject: false,
       input: prompt,

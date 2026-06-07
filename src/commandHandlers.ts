@@ -3,12 +3,14 @@ import { isAuthorized } from "./auth";
 import type { AppConfig } from "./config";
 import type { ModelStore } from "./modelStore";
 import { TaskStore } from "./taskStore";
+import type { WorkspaceStore } from "./workspaceStore";
 
 export function registerCommandHandlers(
   bot: Telegraf,
   config: AppConfig,
   taskStore: TaskStore,
   modelStore: ModelStore,
+  workspaceStore: WorkspaceStore,
 ): void {
   const helpText = buildHelpText();
 
@@ -34,22 +36,56 @@ export function registerCommandHandlers(
   });
 
   bot.command("cxstatus", async (ctx) => {
-    const workspaceExists = await pathExists(config.codexWorkspaceDir);
-    const taskCount = await taskStore.countTasks(String(ctx.chat?.id ?? ""));
-    const latestTask = await taskStore.getLatestTask(String(ctx.chat?.id ?? ""));
+    const chatId = String(ctx.chat?.id ?? "");
+    const workspaceDir = workspaceStore.get(chatId, config.codexWorkspaceDir);
+    const workspaceExists = await pathExists(workspaceDir);
+    const taskCount = await taskStore.countTasks(chatId);
+    const latestTask = await taskStore.getLatestTask(chatId);
+    const model = modelStore.get(chatId, config.codexModel) ?? "(codex 默认)";
 
     await ctx.reply(
       [
         "Agent 状态：运行中",
         `RUN_CODEX_ENABLED：${String(config.runCodexEnabled)}`,
-        `CODEX_WORKSPACE_DIR：${config.codexWorkspaceDir}`,
+        `当前工作目录：${workspaceDir}`,
         `工作目录存在：${workspaceExists ? "是" : "否"}`,
+        `当前模型：${model}`,
         `当前群任务数量：${taskCount}`,
         latestTask
           ? `最近任务：${latestTask.fileName} (${latestTask.status})`
           : "最近任务：暂无",
       ].join("\n"),
     );
+  });
+
+  bot.command("cxproject", async (ctx) => {
+    const userId = String(ctx.from?.id ?? "");
+    const chatId = String(ctx.chat?.id ?? "");
+    if (!isAuthorized(config, { userId, chatId })) {
+      return;
+    }
+
+    const raw = "text" in (ctx.message ?? {}) ? (ctx.message as { text: string }).text : "";
+    const arg = raw.replace(/^\/cxproject(@\S+)?/i, "").trim();
+
+    if (!arg) {
+      await ctx.reply(
+        [
+          `📁 当前工作目录：${workspaceStore.get(chatId, config.codexWorkspaceDir)}`,
+          "",
+          "切换：/cxproject ~/IdeaProjects/项目名",
+        ].join("\n"),
+      );
+      return;
+    }
+
+    const result = workspaceStore.set(chatId, arg);
+    if (!result.ok) {
+      await ctx.reply(`❌ 切换失败：${result.error}\n你给的路径：${arg}`);
+      return;
+    }
+
+    await ctx.reply(`📁 已切到：${result.path}\n下一条任务起我就在这个目录里干活。`);
   });
 
   bot.command("cxmodel", async (ctx) => {
@@ -108,6 +144,7 @@ export function registerCommandHandlers(
 export async function registerCommandMenu(bot: Telegraf): Promise<void> {
   await bot.telegram.setMyCommands([
     { command: "cxhelp", description: "查看自然语言用法和辅助命令" },
+    { command: "cxproject", description: "切换工作目录；不带参数查看当前" },
     { command: "cxmodel", description: "切换 codex 模型；不带参数查看当前" },
     { command: "cxwhoami", description: "查看 user_id 和 chat_id" },
     { command: "cxstatus", description: "查看当前 agent 状态" },
@@ -127,6 +164,7 @@ function buildHelpText(): string {
     "也可以直接发文档/图片（在说明里 @我 或带上 Codex），我会下载下来读取。",
     "",
     "辅助命令：",
+    "· /cxproject <路径> 切换工作目录；不带参数查看当前",
     "· /cxmodel <模型> 切换 codex 模型；不带参数查看当前",
     "· /cxwhoami 查看 user_id 和 chat_id",
     "· /cxstatus 查看当前状态",
