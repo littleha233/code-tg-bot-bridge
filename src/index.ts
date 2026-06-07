@@ -7,6 +7,7 @@ import { CodexRunner } from "./codexRunner";
 import { createLogger } from "./logger";
 import { registerMessageHandler } from "./messageHandler";
 import { ModelStore } from "./modelStore";
+import { SessionStore } from "./sessionStore";
 import { TaskStore } from "./taskStore";
 import { WorkspaceStore } from "./workspaceStore";
 
@@ -18,6 +19,7 @@ async function main(): Promise<void> {
   await taskStore.ensureReady();
   const modelStore = new ModelStore(config.modelsFile);
   const workspaceStore = new WorkspaceStore(config.workspacesFile);
+  const sessionStore = new SessionStore(config.sessionsFile);
 
   logger.info("Preparing Telegram bot", {
     runCodexEnabled: config.runCodexEnabled,
@@ -35,8 +37,17 @@ async function main(): Promise<void> {
   const codexRunner = new CodexRunner(config);
 
   await registerCommandMenu(bot);
-  registerCommandHandlers(bot, config, taskStore, modelStore, workspaceStore);
-  registerMessageHandler(bot, config, taskStore, codexRunner, botUsername, modelStore, workspaceStore);
+  registerCommandHandlers(bot, config, taskStore, modelStore, workspaceStore, sessionStore);
+  registerMessageHandler(
+    bot,
+    config,
+    taskStore,
+    codexRunner,
+    botUsername,
+    modelStore,
+    workspaceStore,
+    sessionStore,
+  );
 
   bot.catch((error, ctx) => {
     logger.error("Unhandled Telegraf error", {

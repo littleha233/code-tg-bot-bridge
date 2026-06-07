@@ -3,78 +3,134 @@ import path from "node:path";
 import { execa } from "execa";
 import type { AppConfig } from "./config";
 import { createLogger } from "./logger";
-import type { ParsedIntent } from "./intentParser";
-import type { TaskRecord } from "./taskStore";
 
 const logger = createLogger("codexRunner");
 const NODE_BIN_DIR = path.dirname(process.execPath);
 
+export interface CodexRunOptions {
+  /** 用户这条消息（已去掉触发词） */
+  message: string;
+  /** 工作目录 */
+  workspaceDir: string;
+  /** 模型（可选，新会话时生效） */
+  model?: string;
+  /** 已有会话 id，则续接；否则开新会话 */
+  sessionId?: string;
+  /** 任务 id，用于日志文件名 */
+  taskId: string;
+}
+
 export interface CodexRunResult {
   ok: boolean;
-  exitCode: number | null;
-  stdout: string;
-  stderr: string;
-  summary: string;
+  /** codex 的自然语言回复 */
+  text: string;
+  /** 本次会话 id（用于下次续接） */
+  sessionId?: string;
   logPrefix: string;
 }
 
 export class CodexRunner {
   constructor(private readonly config: AppConfig) {}
 
-  async runTask(
-    task: TaskRecord,
-    intent: ParsedIntent,
-    recentTaskContent?: string | null,
-    model?: string,
-    workspaceDirArg?: string,
-  ): Promise<CodexRunResult> {
-    const workspaceDir = workspaceDirArg || this.config.codexWorkspaceDir;
-    const workspaceExists = await pathExists(workspaceDir);
-    if (!workspaceExists) {
+  async run(options: CodexRunOptions): Promise<CodexRunResult> {
+    const { message, workspaceDir, model, sessionId, taskId } = options;
+
+    if (!(await pathExists(workspaceDir))) {
       throw new Error(`工作目录不存在：${workspaceDir}`);
     }
 
-    const prompt = buildCodexPrompt(intent, task, workspaceDir, recentTaskContent);
-    const logPrefix = `${task.id}-${Date.now()}`;
-    const promptLogPath = path.join(this.config.logsDir, `${logPrefix}.prompt.md`);
-    const stdoutLogPath = path.join(this.config.logsDir, `${logPrefix}.stdout.log`);
-    const stderrLogPath = path.join(this.config.logsDir, `${logPrefix}.stderr.log`);
+    // 续接会话时只发用户消息（上下文已在会话里）；新会话时附上简短的角色说明
+    const input = sessionId ? message : buildFreshPrompt(message, workspaceDir);
 
-    await writeFile(promptLogPath, prompt, "utf8");
+    const logPrefix = `${taskId}-${Date.now()}`;
+    await writeFile(path.join(this.config.logsDir, `${logPrefix}.prompt.md`), input, "utf8");
+
+    const args = sessionId
+      ? ["exec", "resume", sessionId, "--skip-git-repo-check", "--json", "-"]
+      : ["exec", "--skip-git-repo-check", ...(model ? ["--model", model] : []), "--json", "-"];
 
     logger.info("Running codex exec", {
-      taskId: task.id,
+      taskId,
       workspace: workspaceDir,
-      mode: intent.kind,
-      codeChangePolicy: intent.codeChangePolicy,
+      resume: Boolean(sessionId),
       model: model ?? "(codex 默认)",
     });
 
-    // 指定了模型就传 -m，否则用 codex 自身的默认模型
-    const execArgs = ["exec", "--skip-git-repo-check", ...(model ? ["--model", model] : []), "-"];
-    const result = await execa(this.config.codexBin, execArgs, {
+    const result = await execa(this.config.codexBin, args, {
       cwd: workspaceDir,
       timeout: this.config.codexTimeoutMs,
       reject: false,
-      input: prompt,
+      input,
       env: buildChildEnv(),
     });
 
-    await writeFile(stdoutLogPath, result.stdout ?? "", "utf8");
-    await writeFile(stderrLogPath, result.stderr ?? "", "utf8");
+    await writeFile(path.join(this.config.logsDir, `${logPrefix}.stdout.log`), result.stdout ?? "", "utf8");
+    await writeFile(path.join(this.config.logsDir, `${logPrefix}.stderr.log`), result.stderr ?? "", "utf8");
 
-    const exitCode = result.exitCode ?? null;
-    const summary = summarizeCodexOutput(result.stdout ?? "", result.stderr ?? "", exitCode);
+    const parsed = parseCodexJson(result.stdout ?? "");
+    const exitOk = result.exitCode === 0;
+    const text =
+      parsed.text.trim() ||
+      (exitOk
+        ? "（codex 这次没有产生文本回复）"
+        : `codex 执行失败（退出码 ${result.exitCode ?? "unknown"}）。\n${truncateText((result.stderr ?? "").trim(), 800)}`);
 
     return {
-      ok: exitCode === 0,
-      exitCode,
-      stdout: result.stdout ?? "",
-      stderr: result.stderr ?? "",
-      summary,
+      ok: exitOk && !parsed.errored && parsed.text.trim().length > 0,
+      text,
+      sessionId: parsed.sessionId ?? sessionId,
       logPrefix,
     };
   }
+}
+
+/** 解析 `codex exec --json` 的 JSONL：取 agent_message 文本与 thread_id */
+function parseCodexJson(stdout: string): { text: string; sessionId?: string; errored: boolean } {
+  const messages: string[] = [];
+  let sessionId: string | undefined;
+  let errored = false;
+
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) {
+      continue;
+    }
+    try {
+      const evt = JSON.parse(trimmed) as {
+        type?: string;
+        thread_id?: string;
+        item?: { type?: string; text?: string };
+      };
+      if (evt.type === "thread.started" && evt.thread_id) {
+        sessionId = evt.thread_id;
+      } else if (
+        evt.type === "item.completed" &&
+        evt.item?.type === "agent_message" &&
+        typeof evt.item.text === "string"
+      ) {
+        messages.push(evt.item.text);
+      } else if (evt.type === "turn.failed" || evt.type === "error") {
+        errored = true;
+      }
+    } catch {
+      // 跳过非 JSON 行（codex 偶尔混入普通日志）
+    }
+  }
+
+  return { text: messages.join("\n\n"), sessionId, errored };
+}
+
+function buildFreshPrompt(message: string, workspaceDir: string): string {
+  return [
+    "你是 Telegram 群里的开发助手 Codex，用中文自然地和用户对话，像同事一样直接、简洁。",
+    `当前工作目录：${workspaceDir}`,
+    "可以按需读取文件、运行只读命令来理解项目（首次接触某项目时先看 README / AGENTS.md）。",
+    "默认只做分析、解释和回答；只有当用户明确要求“实现 / 修改 / 修复 / 新增 / 重构”时，才改代码，并保持最小改动、完成后简要说明改了什么、有什么风险。",
+    "回复直接给结论，不要罗列无关的命令回显或冗长日志。",
+    "",
+    "用户消息：",
+    message,
+  ].join("\n");
 }
 
 function buildChildEnv(): NodeJS.ProcessEnv {
@@ -103,74 +159,10 @@ function buildChildEnv(): NodeJS.ProcessEnv {
   return nextEnv;
 }
 
-function buildCodexPrompt(
-  intent: ParsedIntent,
-  task: TaskRecord,
-  workspaceDir: string,
-  recentTaskContent?: string | null,
-): string {
-  const sharedRules = [
-    "你正在作为 Telegram 群里的自然语言项目助手工作。",
-    `当前工作目录固定为：${workspaceDir}`,
-    "先阅读 README、AGENTS.md、package.json，再开始行动。",
-    "先明确一个简短修改/分析计划，再执行。",
-    "不要扩大需求范围，只处理当前消息要求的内容。",
-    "所有输出请用中文，最后给出：修改摘要、测试结果、风险。",
-  ];
-
-  const modeRules =
-    intent.codeChangePolicy === "allow-change"
-      ? [
-          "允许修改代码，但只做完成任务所必需的最小改动。",
-          "完成后运行项目内可用的 typecheck、lint、test、build（按可用性执行，不要臆造命令）。",
-        ]
-      : [
-          "本次任务禁止改代码，不允许写入项目文件。",
-          "可以做只读分析；如果用户要求测试或检查代码，可以执行只读的检查或测试命令。",
-          "不要运行会改变仓库内容的命令。",
-        ];
-
-  const recentTaskSection = recentTaskContent
-    ? ["", "最近一个任务的完整记录如下，请把它作为上下文继续处理：", recentTaskContent].join("\n")
-    : "";
-
-  return [
-    ...sharedRules,
-    ...modeRules,
-    "",
-    `任务 ID：${task.id}`,
-    `任务类型：${intent.kind}`,
-    `代码变更策略：${intent.codeChangePolicy}`,
-    `任务摘要：${task.summary}`,
-    "",
-    "用户原始消息：",
-    task.sourceText,
-    recentTaskSection,
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
-function summarizeCodexOutput(stdout: string, stderr: string, exitCode: number | null): string {
-  const parts: string[] = [];
-  parts.push(exitCode === 0 ? "Codex 执行完成。" : `Codex 执行失败，退出码：${exitCode ?? "unknown"}。`);
-
-  if (stdout.trim()) {
-    parts.push(truncateText(stdout.trim(), 2400));
-  }
-
-  if (exitCode !== 0 && stderr.trim()) {
-    parts.push(`stderr:\n${truncateText(stderr.trim(), 1000)}`);
-  }
-
-  return parts.join("\n\n");
-}
-
 function truncateText(value: string, maxLength: number): string {
   if (value.length <= maxLength) {
     return value;
   }
-
   return `${value.slice(0, maxLength - 11)}\n\n[内容已截断]`;
 }
 

@@ -1,13 +1,13 @@
-import { access } from "node:fs/promises";
 import { message } from "telegraf/filters";
 import { isAuthorized } from "./auth";
 import type { AppConfig } from "./config";
 import { CodexRunner } from "./codexRunner";
 import { downloadTelegramFile } from "./fileDownload";
-import { detectTrigger, parseIntent, type ParsedIntent } from "./intentParser";
+import { detectTrigger } from "./intentParser";
 import { createLogger } from "./logger";
 import type { ModelStore } from "./modelStore";
-import { TaskStore, type CodeChangePolicy, type TaskIntent } from "./taskStore";
+import type { SessionStore } from "./sessionStore";
+import { TaskStore } from "./taskStore";
 import { splitMessageByLength, truncateText } from "./text";
 import type { WorkspaceStore } from "./workspaceStore";
 import type { Telegraf, Context } from "telegraf";
@@ -15,8 +15,21 @@ import type { Telegraf, Context } from "telegraf";
 const logger = createLogger("messageHandler");
 const busyChats = new Set<string>();
 
-interface BotContext extends Context {
-  message: Context["message"] & { text: string };
+interface Deps {
+  config: AppConfig;
+  taskStore: TaskStore;
+  codexRunner: CodexRunner;
+  botUsername: string | undefined;
+  modelStore: ModelStore;
+  workspaceStore: WorkspaceStore;
+  sessionStore: SessionStore;
+}
+
+interface ChatInfo {
+  userId: string;
+  username: string;
+  chatId: string;
+  chatType: string;
 }
 
 export function registerMessageHandler(
@@ -27,247 +40,67 @@ export function registerMessageHandler(
   botUsername: string | undefined,
   modelStore: ModelStore,
   workspaceStore: WorkspaceStore,
+  sessionStore: SessionStore,
 ): void {
-  bot.on(message("text"), async (ctx) => {
-    await handleTextMessage(
-      ctx as BotContext,
-      config,
-      taskStore,
-      codexRunner,
-      botUsername,
-      modelStore,
-      workspaceStore,
-    );
-  });
+  const deps: Deps = {
+    config,
+    taskStore,
+    codexRunner,
+    botUsername,
+    modelStore,
+    workspaceStore,
+    sessionStore,
+  };
 
-  // 文档 / 图片附件：下载到本机后把本地路径交给 codex 读取
+  bot.on(message("text"), async (ctx) => {
+    await handleText(ctx, deps);
+  });
   bot.on(message("document"), async (ctx) => {
-    await handleAttachmentMessage(ctx, config, taskStore, codexRunner, botUsername, modelStore, workspaceStore);
+    await handleAttachment(ctx, deps);
   });
   bot.on(message("photo"), async (ctx) => {
-    await handleAttachmentMessage(ctx, config, taskStore, codexRunner, botUsername, modelStore, workspaceStore);
+    await handleAttachment(ctx, deps);
   });
 }
 
-async function handleTextMessage(
-  ctx: BotContext,
-  config: AppConfig,
-  taskStore: TaskStore,
-  codexRunner: CodexRunner,
-  botUsername: string | undefined,
-  modelStore: ModelStore,
-  workspaceStore: WorkspaceStore,
-): Promise<void> {
-  const text = ctx.message.text.trim();
-  const chatType = ctx.chat?.type ?? "unknown";
-  const userId = String(ctx.from?.id ?? "");
-  const username = ctx.from?.username ?? ctx.from?.first_name ?? "unknown";
-  const chatId = String(ctx.chat?.id ?? "");
-  const replyToUsername = (ctx.message as { reply_to_message?: { from?: { username?: string } } })
-    .reply_to_message?.from?.username;
-  const isReplyToBot = Boolean(botUsername && replyToUsername === botUsername);
-
-  const triggerMatch = detectTrigger(text, chatType, botUsername, config.botTriggerNames, isReplyToBot);
-  if (!triggerMatch.shouldProcess) {
-    return;
-  }
-
-  const intent = parseIntent(triggerMatch.cleanedText);
-
-  logger.info("Incoming message", {
-    userId,
-    username,
-    chatId,
-    chatType,
-    intent: intent.kind,
-    summary: intent.summary,
-  });
-
-  if (intent.kind === "identity") {
-    await replyLongMessage(ctx, buildIdentityReply(userId, username, chatId, chatType));
-    return;
-  }
-
-  if (!isAuthorized(config, { userId, chatId })) {
-    await replyLongMessage(
-      ctx,
-      "当前用户或群未加入白名单。先发送“我是谁”获取 user_id 和 chat_id，再把它们写入 .env。",
-    );
-    return;
-  }
-
-  if (intent.kind === "status") {
-    await replyLongMessage(ctx, await buildStatusReply(config, taskStore, workspaceStore.get(chatId, config.codexWorkspaceDir)));
-    return;
-  }
-
-  if (intent.kind === "casual") {
-    await replyLongMessage(
-      ctx,
-      "我在。如果你要我介入项目，可以直接说“Codex，帮我实现登录页”或“先不要改代码，只分析方案”。",
-    );
-    return;
-  }
-
-  if (intent.kind === "continue") {
-    const recentTask = await taskStore.getLatestTask(chatId);
-    if (!recentTask) {
-      await replyLongMessage(
-        ctx,
-        "目前还没有最近任务可以继续。你可以先发一句“Codex，帮我记录一个任务：xxx”。",
-      );
-      return;
-    }
-
-    const inheritedIntent = overrideIntentForContinue(intent, recentTask.codeChangePolicy);
-    await handleTaskIntent(ctx, config, taskStore, codexRunner, modelStore, inheritedIntent, {
-      userId,
-      username,
-      chatId,
-      chatType,
-      workspaceDir: workspaceStore.get(chatId, config.codexWorkspaceDir),
-      relatedTaskId: recentTask.id,
-      recentTaskContent: await taskStore.getLatestTaskContent(chatId),
-    });
-    return;
-  }
-
-  await handleTaskIntent(ctx, config, taskStore, codexRunner, modelStore, intent, {
-    userId,
-    username,
-    chatId,
-    chatType,
-    workspaceDir: workspaceStore.get(chatId, config.codexWorkspaceDir),
-    relatedTaskId: undefined,
-    recentTaskContent: undefined,
-  });
+function readInfo(ctx: Context): ChatInfo {
+  return {
+    userId: String(ctx.from?.id ?? ""),
+    username: ctx.from?.username ?? ctx.from?.first_name ?? "unknown",
+    chatId: String(ctx.chat?.id ?? ""),
+    chatType: ctx.chat?.type ?? "unknown",
+  };
 }
 
-async function handleTaskIntent(
-  ctx: BotContext,
-  config: AppConfig,
-  taskStore: TaskStore,
-  codexRunner: CodexRunner,
-  modelStore: ModelStore,
-  intent: ParsedIntent,
-  context: {
-    userId: string;
-    username: string;
-    chatId: string;
-    chatType: string;
-    workspaceDir: string;
-    relatedTaskId?: string;
-    recentTaskContent?: string | null;
-  },
-): Promise<void> {
-  if (busyChats.has(context.chatId)) {
-    await replyLongMessage(ctx, "⏳ 这个群里上一个任务还在处理中，请稍候再发下一条。");
-    return;
-  }
-
-  const prefix = intentToPrefix(intent.kind);
-  const taskIntent = intentToTaskIntent(intent.kind);
-  const task = await taskStore.createTask({
-    prefix,
-    intent: taskIntent,
-    codeChangePolicy: intent.codeChangePolicy,
-    summary: intent.summary,
-    sourceText: intent.cleanedText,
-    userId: context.userId,
-    username: context.username,
-    chatId: context.chatId,
-    chatType: context.chatType,
-    relatedTaskId: context.relatedTaskId,
-  });
-
-  if (intent.kind === "record") {
-    task.status = "recorded";
-    task.executionNotes = "仅记录任务，不调用 Codex。";
-    await taskStore.updateTask(task);
-    await replyLongMessage(ctx, `任务已记录。\n文件：${task.fileName}\n摘要：${task.summary}`);
-    return;
-  }
-
-  if (!config.runCodexEnabled) {
-    task.status = "recorded";
-    task.executionNotes = "RUN_CODEX_ENABLED=false，本次仅记录任务，没有实际调用 Codex。";
-    await taskStore.updateTask(task);
-    await replyLongMessage(
-      ctx,
-      `任务已记录，但 Codex 执行未开启。\n文件：${task.fileName}\n模式：${intent.codeChangePolicy}\n摘要：${task.summary}`,
-    );
-    return;
-  }
-
-  task.status = "running";
-  task.executionNotes = "Codex 执行中。";
-  await taskStore.updateTask(task);
-  busyChats.add(context.chatId);
-  const ackMessage = await ctx.reply(`🐾 收到，正在处理…\n任务：${task.fileName}`).catch(() => null);
-  await ctx.replyWithChatAction("typing").catch(() => {});
-  const typingTimer = setInterval(() => {
-    ctx.replyWithChatAction("typing").catch(() => {});
-  }, 5000);
-
-  try {
-    const model = modelStore.get(context.chatId, config.codexModel);
-    const result = await codexRunner.runTask(
-      task,
-      intent,
-      context.recentTaskContent,
-      model,
-      context.workspaceDir,
-    );
-    task.status = result.ok ? "completed" : "failed";
-    task.logPrefix = result.logPrefix;
-    task.executionNotes = result.summary;
-    await taskStore.updateTask(task);
-    if (ackMessage) {
-      await ctx.telegram.deleteMessage(Number(context.chatId), ackMessage.message_id).catch(() => {});
-    }
-
-    await replyLongMessage(
-      ctx,
-      [
-        result.ok ? "Codex 已执行完成。" : "Codex 执行结束，但结果未完全成功。",
-        `任务：${task.fileName}`,
-        `日志前缀：${result.logPrefix}`,
-        "",
-        truncateText(result.summary, 3200),
-      ].join("\n"),
-    );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    task.status = "failed";
-    task.executionNotes = `执行异常：${message}`;
-    await taskStore.updateTask(task);
-    logger.error("Codex execution failed", { taskId: task.id, message });
-    if (ackMessage) {
-      await ctx.telegram.deleteMessage(Number(context.chatId), ackMessage.message_id).catch(() => {});
-    }
-    await replyLongMessage(ctx, `Codex 执行失败。\n任务：${task.fileName}\n错误：${message}`);
-  } finally {
-    clearInterval(typingTimer);
-    busyChats.delete(context.chatId);
-  }
+function isReplyToBot(ctx: Context, botUsername: string | undefined): boolean {
+  const replyTo = (ctx.message as { reply_to_message?: { from?: { username?: string } } } | undefined)
+    ?.reply_to_message?.from?.username;
+  return Boolean(botUsername && replyTo === botUsername);
 }
 
-async function handleAttachmentMessage(
-  ctx: Context,
-  config: AppConfig,
-  taskStore: TaskStore,
-  codexRunner: CodexRunner,
-  botUsername: string | undefined,
-  modelStore: ModelStore,
-  workspaceStore: WorkspaceStore,
-): Promise<void> {
+async function handleText(ctx: Context, deps: Deps): Promise<void> {
+  const text = ((ctx.message as { text?: string } | undefined)?.text ?? "").trim();
+  const info = readInfo(ctx);
+  const trigger = detectTrigger(
+    text,
+    info.chatType,
+    deps.botUsername,
+    deps.config.botTriggerNames,
+    isReplyToBot(ctx, deps.botUsername),
+  );
+  if (!trigger.shouldProcess) {
+    return; // 不是在叫 cx，忽略
+  }
+  await processCodexMessage(ctx, deps, info, trigger.cleanedText);
+}
+
+async function handleAttachment(ctx: Context, deps: Deps): Promise<void> {
   const msg = ctx.message as
     | {
         message_id: number;
         caption?: string;
         document?: { file_id: string; file_name?: string; mime_type?: string };
         photo?: Array<{ file_id: string }>;
-        reply_to_message?: { from?: { username?: string } };
       }
     | undefined;
   if (!msg) {
@@ -275,24 +108,24 @@ async function handleAttachmentMessage(
   }
 
   const caption = (msg.caption ?? "").trim();
-  const chatType = ctx.chat?.type ?? "unknown";
-  const userId = String(ctx.from?.id ?? "");
-  const username = ctx.from?.username ?? ctx.from?.first_name ?? "unknown";
-  const chatId = String(ctx.chat?.id ?? "");
-  const isReplyToBot = Boolean(botUsername && msg.reply_to_message?.from?.username === botUsername);
-
-  const triggerMatch = detectTrigger(caption, chatType, botUsername, config.botTriggerNames, isReplyToBot);
-  if (!triggerMatch.shouldProcess) {
-    return; // 附件没 @我 / 没带触发词 / 不是回复我 → 不处理
-  }
-
-  if (!isAuthorized(config, { userId, chatId })) {
-    await replyLongMessage(ctx as BotContext, "当前用户或群未加入白名单，无法处理附件。");
+  const info = readInfo(ctx);
+  const trigger = detectTrigger(
+    caption,
+    info.chatType,
+    deps.botUsername,
+    deps.config.botTriggerNames,
+    isReplyToBot(ctx, deps.botUsername),
+  );
+  if (!trigger.shouldProcess) {
     return;
   }
 
-  if (busyChats.has(chatId)) {
-    await replyLongMessage(ctx as BotContext, "⏳ 这个群里上一个任务还在处理中，请稍候再发。");
+  if (!isAuthorized(deps.config, { userId: info.userId, chatId: info.chatId })) {
+    await replyLong(ctx, "当前用户或群未加入白名单，无法处理附件。发送 /cxwhoami 获取 id 后写入 .env。");
+    return;
+  }
+  if (busyChats.has(info.chatId)) {
+    await replyLong(ctx, "⏳ 这个群里上一个任务还在处理中，请稍候再发。");
     return;
   }
 
@@ -304,7 +137,7 @@ async function handleAttachmentMessage(
     fileName = msg.document.file_name;
     mime = msg.document.mime_type;
   } else if (msg.photo && msg.photo.length > 0) {
-    fileId = msg.photo[msg.photo.length - 1].file_id; // 取最大尺寸
+    fileId = msg.photo[msg.photo.length - 1].file_id;
     fileName = "photo.jpg";
     mime = "image/jpeg";
   } else {
@@ -318,161 +151,136 @@ async function handleAttachmentMessage(
       ctx,
       fileId,
       fileName,
-      config.telegramProxyUrl,
-      config.downloadsDir,
+      deps.config.telegramProxyUrl,
+      deps.config.downloadsDir,
     );
   } catch (error) {
-    await replyLongMessage(
-      ctx as BotContext,
-      `下载附件失败：${error instanceof Error ? error.message : String(error)}`,
-    );
+    await replyLong(ctx, `下载附件失败：${error instanceof Error ? error.message : String(error)}`);
     return;
   } finally {
     if (note) {
-      await ctx.telegram.deleteMessage(Number(chatId), note.message_id).catch(() => {});
+      await ctx.telegram.deleteMessage(Number(info.chatId), note.message_id).catch(() => {});
     }
   }
 
-  logger.info("Downloaded attachment", { chatId, fileName, mime, localPath });
+  logger.info("Downloaded attachment", { chatId: info.chatId, fileName, mime, localPath });
 
-  const captionText = triggerMatch.cleanedText || "请读取并分析这个附件。";
-  const intent = buildAttachmentIntent(captionText, localPath, fileName, mime);
-
-  await handleTaskIntent(ctx as BotContext, config, taskStore, codexRunner, modelStore, intent, {
-    userId,
-    username,
-    chatId,
-    chatType,
-    workspaceDir: workspaceStore.get(chatId, config.codexWorkspaceDir),
-    relatedTaskId: undefined,
-    recentTaskContent: undefined,
-  });
-}
-
-function buildAttachmentIntent(
-  captionText: string,
-  localPath: string,
-  fileName: string | undefined,
-  mime: string | undefined,
-): ParsedIntent {
-  const base = parseIntent(captionText);
-  // 附件默认按“读取/分析”处理，不改代码；只有 caption 明确要求改代码才允许改
-  let kind = base.kind;
-  let codeChangePolicy = base.codeChangePolicy;
-  if (kind !== "development" && kind !== "analysis") {
-    kind = "analysis";
-    codeChangePolicy = "no-change";
-  } else if (kind === "analysis") {
-    codeChangePolicy = "no-change";
-  }
-
-  const fileNote = [
+  const message = [
+    trigger.cleanedText || "请读取并处理这个附件。",
     "",
-    `[用户发来一个附件，已下载到本机绝对路径：${localPath}`,
-    ` 文件名：${fileName ?? "(无)"}，类型：${mime ?? "(未知)"}]`,
-    "请读取/分析该文件；若是 .docx/.doc/.xlsx/.pptx 等非纯文本，可用 macOS 自带 `textutil -convert txt -stdout <文件>` 等工具转换后读取。",
+    `[附件已下载到本机：${localPath}（文件名：${fileName ?? "未知"}，类型：${mime ?? "未知"}）。`,
+    "请读取/分析它；若是 .docx/.doc/.xlsx/.pptx 等非纯文本，可用 textutil -convert txt -stdout <文件> 等工具转换后读取。]",
   ].join("\n");
 
-  return {
-    kind,
-    codeChangePolicy,
-    summary: truncateText(captionText.replace(/\s+/g, " ").trim() || "处理附件", 120),
-    cleanedText: `${captionText}\n${fileNote}`,
-    shouldCreateTask: true,
-  };
+  await processCodexMessage(ctx, deps, info, message);
 }
 
-async function buildStatusReply(
-  config: AppConfig,
-  taskStore: TaskStore,
-  workspaceDir: string,
-): Promise<string> {
-  const taskCount = await taskStore.countTasks();
-  const latestTask = await taskStore.getLatestTask();
-  const workspaceExists = await pathExists(workspaceDir);
+async function processCodexMessage(
+  ctx: Context,
+  deps: Deps,
+  info: ChatInfo,
+  message: string,
+): Promise<void> {
+  const { config, taskStore, codexRunner, modelStore, workspaceStore, sessionStore } = deps;
 
-  return [
-    "Agent 状态：运行中",
-    `RUN_CODEX_ENABLED：${String(config.runCodexEnabled)}`,
-    `当前工作目录：${workspaceDir}`,
-    `工作目录存在：${workspaceExists ? "是" : "否"}`,
-    `当前任务数量：${taskCount}`,
-    latestTask
-      ? `最近任务：${latestTask.fileName} (${latestTask.status})`
-      : "最近任务：暂无",
-  ].join("\n");
+  if (!isAuthorized(config, { userId: info.userId, chatId: info.chatId })) {
+    await replyLong(ctx, "当前用户或群未加入白名单。发送 /cxwhoami 获取 user_id 和 chat_id，再写入 .env。");
+    return;
+  }
+  if (!message.trim()) {
+    await replyLong(ctx, "你想让我做什么？直接说就行。");
+    return;
+  }
+  if (busyChats.has(info.chatId)) {
+    await replyLong(ctx, "⏳ 这个群里上一个任务还在处理中，请稍候再发。");
+    return;
+  }
+  if (!config.runCodexEnabled) {
+    await replyLong(ctx, "Codex 执行未开启（RUN_CODEX_ENABLED=false），只能记录不能执行。");
+    return;
+  }
+
+  const workspaceDir = workspaceStore.get(info.chatId, config.codexWorkspaceDir);
+  const model = modelStore.get(info.chatId, config.codexModel);
+
+  const task = await taskStore.createTask({
+    prefix: "DEV",
+    intent: "development",
+    codeChangePolicy: "allow-change",
+    summary: truncateText(message.replace(/\s+/g, " ").trim(), 120),
+    sourceText: message,
+    userId: info.userId,
+    username: info.username,
+    chatId: info.chatId,
+    chatType: info.chatType,
+  });
+
+  busyChats.add(info.chatId);
+  const ack = await ctx.reply("🐾 收到，正在处理…").catch(() => null);
+  await ctx.replyWithChatAction("typing").catch(() => {});
+  const typingTimer = setInterval(() => {
+    ctx.replyWithChatAction("typing").catch(() => {});
+  }, 5000);
+
+  try {
+    const existingSession = sessionStore.get(info.chatId);
+    let result = await codexRunner.run({
+      message,
+      workspaceDir,
+      model,
+      sessionId: existingSession,
+      taskId: task.id,
+    });
+
+    // 续接失败（会话过期等）→ 清掉旧会话，用新会话重试一次
+    if (!result.ok && existingSession) {
+      logger.warn("Resume likely failed, retrying with a fresh session", { chatId: info.chatId });
+      sessionStore.clear(info.chatId);
+      result = await codexRunner.run({
+        message,
+        workspaceDir,
+        model,
+        sessionId: undefined,
+        taskId: task.id,
+      });
+    }
+
+    if (result.sessionId) {
+      sessionStore.set(info.chatId, result.sessionId);
+    }
+
+    task.status = result.ok ? "completed" : "failed";
+    task.logPrefix = result.logPrefix;
+    task.executionNotes = truncateText(result.text, 2000);
+    await taskStore.updateTask(task);
+
+    if (ack) {
+      await ctx.telegram.deleteMessage(Number(info.chatId), ack.message_id).catch(() => {});
+    }
+    await replyLong(ctx, result.text);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    task.status = "failed";
+    task.executionNotes = `执行异常：${errorMessage}`;
+    await taskStore.updateTask(task);
+    logger.error("Codex run failed", { taskId: task.id, message: errorMessage });
+    if (ack) {
+      await ctx.telegram.deleteMessage(Number(info.chatId), ack.message_id).catch(() => {});
+    }
+    await replyLong(ctx, `处理失败：${errorMessage}`);
+  } finally {
+    clearInterval(typingTimer);
+    busyChats.delete(info.chatId);
+  }
 }
 
-function buildIdentityReply(
-  userId: string,
-  username: string,
-  chatId: string,
-  chatType: string,
-): string {
-  return [
-    "身份信息如下：",
-    `user_id: ${userId}`,
-    `username: ${username}`,
-    `chat_id: ${chatId}`,
-    `chat_type: ${chatType}`,
-  ].join("\n");
-}
-
-function overrideIntentForContinue(intent: ParsedIntent, recentPolicy: CodeChangePolicy): ParsedIntent {
-  if (intent.codeChangePolicy === "allow-change" || intent.codeChangePolicy === "no-change") {
-    return intent;
-  }
-
-  return {
-    ...intent,
-    codeChangePolicy: recentPolicy === "record-only" ? "no-change" : recentPolicy,
-  };
-}
-
-function intentToPrefix(intentKind: ParsedIntent["kind"]): "TASK" | "ANALYZE" | "DEV" {
-  if (intentKind === "record") {
-    return "TASK";
-  }
-
-  if (intentKind === "analysis") {
-    return "ANALYZE";
-  }
-
-  return "DEV";
-}
-
-function intentToTaskIntent(intentKind: ParsedIntent["kind"]): TaskIntent {
-  if (intentKind === "record") {
-    return "record";
-  }
-
-  if (intentKind === "analysis") {
-    return "analysis";
-  }
-
-  if (intentKind === "continue") {
-    return "continue";
-  }
-
-  return "development";
-}
-
-async function replyLongMessage(ctx: BotContext, text: string): Promise<void> {
+async function replyLong(ctx: Context, text: string): Promise<void> {
+  const replyToId = (ctx.message as { message_id?: number } | undefined)?.message_id;
   const chunks = splitMessageByLength(text, 3500);
   for (const chunk of chunks) {
-    await ctx.reply(chunk, {
-      reply_parameters: {
-        message_id: ctx.message.message_id,
-      },
-    });
-  }
-}
-
-async function pathExists(targetPath: string): Promise<boolean> {
-  try {
-    await access(targetPath);
-    return true;
-  } catch {
-    return false;
+    await ctx.reply(
+      chunk,
+      replyToId ? { reply_parameters: { message_id: replyToId } } : undefined,
+    );
   }
 }

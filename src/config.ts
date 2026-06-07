@@ -66,6 +66,7 @@ export interface AppConfig {
   stateDir: string;
   modelsFile: string;
   workspacesFile: string;
+  sessionsFile: string;
   downloadsDir: string;
 }
 
@@ -98,6 +99,7 @@ export function loadConfig(): AppConfig {
     stateDir: path.join(projectRootDir, "state"),
     modelsFile: path.join(projectRootDir, "state", "models.json"),
     workspacesFile: path.join(projectRootDir, "state", "workspaces.json"),
+    sessionsFile: path.join(projectRootDir, "state", "sessions.json"),
     downloadsDir: path.join(projectRootDir, "downloads"),
   };
 }

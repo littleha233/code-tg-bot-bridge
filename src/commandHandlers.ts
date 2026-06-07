@@ -2,6 +2,7 @@ import type { Context, Telegraf } from "telegraf";
 import { isAuthorized } from "./auth";
 import type { AppConfig } from "./config";
 import type { ModelStore } from "./modelStore";
+import type { SessionStore } from "./sessionStore";
 import { TaskStore } from "./taskStore";
 import type { WorkspaceStore } from "./workspaceStore";
 
@@ -11,8 +12,19 @@ export function registerCommandHandlers(
   taskStore: TaskStore,
   modelStore: ModelStore,
   workspaceStore: WorkspaceStore,
+  sessionStore: SessionStore,
 ): void {
   const helpText = buildHelpText();
+
+  bot.command("cxnew", async (ctx) => {
+    const userId = String(ctx.from?.id ?? "");
+    const chatId = String(ctx.chat?.id ?? "");
+    if (!isAuthorized(config, { userId, chatId })) {
+      return;
+    }
+    sessionStore.clear(chatId);
+    await ctx.reply("🆕 已开启新会话，之前的对话上下文已清空。");
+  });
 
   bot.command(["start", "cxhelp"], async (ctx) => {
     await ctx.reply(helpText);
@@ -144,6 +156,7 @@ export function registerCommandHandlers(
 export async function registerCommandMenu(bot: Telegraf): Promise<void> {
   await bot.telegram.setMyCommands([
     { command: "cxhelp", description: "查看自然语言用法和辅助命令" },
+    { command: "cxnew", description: "清空对话上下文、开新会话" },
     { command: "cxproject", description: "切换工作目录；不带参数查看当前" },
     { command: "cxmodel", description: "切换 codex 模型；不带参数查看当前" },
     { command: "cxwhoami", description: "查看 user_id 和 chat_id" },
@@ -156,14 +169,15 @@ function buildHelpText(): string {
   return [
     "我是 Codex，可以在群里用自然语言协作。",
     "",
-    "推荐直接说：",
-    "· Codex，帮我实现登录页",
-    "· Codex，先不要改代码，只分析方案",
-    "· Codex，继续刚才那个任务",
+    "直接用自然语言说就行，我会记住上下文连续对话：",
+    "· cx，帮我实现登录页",
+    "· cx，先不要改代码，只分析一下这个模块",
+    "· cx，刚才那个问题我已经改好了，你再看看",
     "",
-    "也可以直接发文档/图片（在说明里 @我 或带上 Codex），我会下载下来读取。",
+    "也可以直接发文档/图片（在说明里 @我 或带上 cx），我会下载下来读取。",
     "",
     "辅助命令：",
+    "· /cxnew 清空上下文、开新会话",
     "· /cxproject <路径> 切换工作目录；不带参数查看当前",
     "· /cxmodel <模型> 切换 codex 模型；不带参数查看当前",
     "· /cxwhoami 查看 user_id 和 chat_id",
