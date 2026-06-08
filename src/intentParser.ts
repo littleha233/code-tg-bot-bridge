@@ -102,10 +102,21 @@ export function detectTrigger(
   }
 
   const lowerText = sourceText.toLowerCase();
-  const hasConfiguredTrigger = triggerNames.some((name) => lowerText.includes(name.toLowerCase()));
+  // 触发词必须出现在“开头”（用于称呼），避免句中提到别的 agent 名字（如“交给 cx 开发”）误触发。
+  // @提及 仍可出现在任意位置（属于显式点名）。
+  const lead = sourceText.replace(/^[\s,，:：。.!！?？、~～\-—_]+/, "");
+  const lowerLead = lead.toLowerCase();
+  const startsWithTrigger = triggerNames.some((name) => {
+    const lowered = name.toLowerCase();
+    if (!lowerLead.startsWith(lowered)) {
+      return false;
+    }
+    const after = lead.slice(name.length);
+    return after === "" || !/^[a-z0-9]/i.test(after); // 词边界，避免 cx 命中 cxabc
+  });
   const hasBotMention = botUsername ? lowerText.includes(`@${botUsername.toLowerCase()}`) : false;
 
-  if (!hasConfiguredTrigger && !hasBotMention) {
+  if (!startsWithTrigger && !hasBotMention) {
     return { shouldProcess: false, cleanedText: "" };
   }
 
