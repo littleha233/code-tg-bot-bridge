@@ -1,3 +1,6 @@
+import { existsSync, statSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { message } from "telegraf/filters";
 import { isAuthorized } from "./auth";
 import type { AppConfig } from "./config";
@@ -252,7 +255,13 @@ async function processCodexMessage(
     await taskStore.updateTask(task);
 
     await progress.finish(result.ok);
-    await replyLong(ctx, result.text);
+    const { text: cleaned, files } = extractAttachments(result.text);
+    if (cleaned) {
+      await replyLong(ctx, cleaned);
+    } else if (files.length === 0) {
+      await replyLong(ctx, result.text || "(空)");
+    }
+    await sendAttachments(ctx, files);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     task.status = "failed";
@@ -365,6 +374,49 @@ class ProgressReporter {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = undefined;
+    }
+  }
+}
+
+// 从 codex 回复里提取要发送的本机文件：[[file: 路径]] 或 Markdown 图片 ![](路径)
+const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]);
+
+function expandHomePath(p: string): string {
+  if (p === "~") return os.homedir();
+  if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
+function extractAttachments(text: string): { text: string; files: string[] } {
+  const files: string[] = [];
+  let cleaned = text;
+  const patterns = [/!\[[^\]]*\]\(\s*([^)]+?)\s*\)/g, /\[\[file:\s*([^\]]+?)\s*\]\]/g];
+  for (const re of patterns) {
+    cleaned = cleaned.replace(re, (match, captured: string) => {
+      const filePath = expandHomePath(captured.trim());
+      if (filePath.startsWith("/") && existsSync(filePath) && statSync(filePath).isFile()) {
+        files.push(filePath);
+        return "";
+      }
+      return match; // 不是本地文件（如 http 链接）就原样保留
+    });
+  }
+  return { text: cleaned.replace(/\n{3,}/g, "\n\n").trim(), files };
+}
+
+async function sendAttachments(ctx: Context, files: string[]): Promise<void> {
+  for (const file of files) {
+    const ext = (file.match(/\.[^./]+$/)?.[0] ?? "").toLowerCase();
+    try {
+      if (IMAGE_EXT.has(ext)) {
+        await ctx.replyWithPhoto({ source: file });
+      } else {
+        await ctx.replyWithDocument({ source: file });
+      }
+    } catch (error) {
+      await ctx.reply(
+        `⚠️ 上传文件失败 ${path.basename(file)}：${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 }

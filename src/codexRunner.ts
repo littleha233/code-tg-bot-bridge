@@ -7,6 +7,11 @@ import { createLogger } from "./logger";
 const logger = createLogger("codexRunner");
 const NODE_BIN_DIR = path.dirname(process.execPath);
 
+// 告诉 codex 如何把本机文件发到群里（桥接层会拦截标记并上传）
+const FILE_HINT =
+  "如需把本机文件（图片、二维码、截图、文档等）发到当前群，请在回复中单独写一行：" +
+  "[[file: 绝对路径]]（或 Markdown 图片 ![](绝对路径)），系统会自动上传，别只贴本地路径。";
+
 export interface CodexRunOptions {
   /** 用户这条消息（已去掉触发词） */
   message: string;
@@ -41,8 +46,8 @@ export class CodexRunner {
       throw new Error(`工作目录不存在：${workspaceDir}`);
     }
 
-    // 续接会话时只发用户消息（上下文已在会话里）；新会话时附上简短的角色说明
-    const input = sessionId ? message : buildFreshPrompt(message, workspaceDir);
+    // 续接会话时只发用户消息（上下文已在会话里，附一句发文件用法）；新会话时附完整角色说明
+    const input = sessionId ? `${message}\n\n（${FILE_HINT}）` : buildFreshPrompt(message, workspaceDir);
 
     const logPrefix = `${taskId}-${Date.now()}`;
     await writeFile(path.join(this.config.logsDir, `${logPrefix}.prompt.md`), input, "utf8");
@@ -182,6 +187,7 @@ function buildFreshPrompt(message: string, workspaceDir: string): string {
     "【主动推进】如果是多步骤/较重的任务，请一次性把它做完：自己规划步骤并连续执行（读文件 → 改代码 → 跑测试/构建 → 修正），不要做一步就停下来等我确认。只有遇到真正需要我拍板的岔路（不可逆操作、需求二义、缺少关键信息）才停下来问我，并说清楚卡在哪、需要我决定什么。",
     "【改代码原则】默认只做分析与回答；只有用户明确要求“实现/修改/修复/新增/重构”时才改代码，保持最小改动，完成后说明改了什么、跑了哪些验证、有什么风险。",
     "【汇报】最后用要点汇报：做了什么、结果如何、还有什么待办或风险。回复直接给结论，不要贴大段命令回显。",
+    `【发文件】${FILE_HINT}`,
     "",
     "用户消息：",
     message,
