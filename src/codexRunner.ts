@@ -18,6 +18,8 @@ export interface CodexRunOptions {
   sessionId?: string;
   /** 任务 id，用于日志文件名 */
   taskId: string;
+  /** 实时进度回调：每执行一步（命令/改动）回调一次，用于推送到群里 */
+  onProgress?: (step: string) => void;
 }
 
 export interface CodexRunResult {
@@ -62,7 +64,8 @@ export class CodexRunner {
       bypassSandbox: this.config.codexBypassSandbox,
     });
 
-    const result = await execa(this.config.codexBin, args, {
+    // 流式读取 codex 的 JSONL，边跑边回调进度，同时收集最终回复
+    const subprocess = execa(this.config.codexBin, args, {
       cwd: workspaceDir,
       timeout: this.config.codexTimeoutMs,
       reject: false,
@@ -70,69 +73,115 @@ export class CodexRunner {
       env: buildChildEnv(),
     });
 
+    const messages: string[] = [];
+    let resolvedSessionId: string | undefined;
+    let errored = false;
+    let buffer = "";
+
+    const handleLine = (line: string): void => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("{")) {
+        return;
+      }
+      let evt: {
+        type?: string;
+        thread_id?: string;
+        item?: {
+          type?: string;
+          text?: string;
+          command?: string;
+          status?: string;
+          changes?: Array<{ path?: string }>;
+        };
+      };
+      try {
+        evt = JSON.parse(trimmed);
+      } catch {
+        return; // 跳过非 JSON 行
+      }
+
+      if (evt.type === "thread.started" && evt.thread_id) {
+        resolvedSessionId = evt.thread_id;
+      } else if (evt.type === "item.started" && evt.item?.type === "command_execution") {
+        options.onProgress?.(`🔧 ${shorten(stripShell(evt.item.command ?? ""), 120)}`);
+      } else if (evt.type === "item.completed") {
+        const item = evt.item;
+        if (item?.type === "agent_message" && typeof item.text === "string") {
+          messages.push(item.text);
+        } else if (item?.type === "file_change" && Array.isArray(item.changes)) {
+          const files = item.changes
+            .map((change) => path.basename(String(change.path ?? "")))
+            .filter(Boolean)
+            .join(", ");
+          if (files) {
+            options.onProgress?.(`📝 改动: ${shorten(files, 120)}`);
+          }
+        } else if (item?.type === "command_execution" && item.status === "failed") {
+          options.onProgress?.(`⚠️ 命令失败: ${shorten(stripShell(item.command ?? ""), 100)}`);
+        }
+      } else if (evt.type === "turn.failed" || evt.type === "error") {
+        errored = true;
+      }
+    };
+
+    subprocess.stdout?.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString();
+      let newlineIndex: number;
+      while ((newlineIndex = buffer.indexOf("\n")) >= 0) {
+        handleLine(buffer.slice(0, newlineIndex));
+        buffer = buffer.slice(newlineIndex + 1);
+      }
+    });
+
+    const result = await subprocess;
+    if (buffer.trim()) {
+      handleLine(buffer);
+    }
+
     await writeFile(path.join(this.config.logsDir, `${logPrefix}.stdout.log`), result.stdout ?? "", "utf8");
     await writeFile(path.join(this.config.logsDir, `${logPrefix}.stderr.log`), result.stderr ?? "", "utf8");
 
-    const parsed = parseCodexJson(result.stdout ?? "");
     const exitOk = result.exitCode === 0;
+    const finalText = messages.join("\n\n").trim();
     const text =
-      parsed.text.trim() ||
+      finalText ||
       (exitOk
         ? "（codex 这次没有产生文本回复）"
         : `codex 执行失败（退出码 ${result.exitCode ?? "unknown"}）。\n${truncateText((result.stderr ?? "").trim(), 800)}`);
 
     return {
-      ok: exitOk && !parsed.errored && parsed.text.trim().length > 0,
+      ok: exitOk && !errored && finalText.length > 0,
       text,
-      sessionId: parsed.sessionId ?? sessionId,
+      sessionId: resolvedSessionId ?? sessionId,
       logPrefix,
     };
   }
 }
 
-/** 解析 `codex exec --json` 的 JSONL：取 agent_message 文本与 thread_id */
-function parseCodexJson(stdout: string): { text: string; sessionId?: string; errored: boolean } {
-  const messages: string[] = [];
-  let sessionId: string | undefined;
-  let errored = false;
-
-  for (const line of stdout.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("{")) {
-      continue;
-    }
-    try {
-      const evt = JSON.parse(trimmed) as {
-        type?: string;
-        thread_id?: string;
-        item?: { type?: string; text?: string };
-      };
-      if (evt.type === "thread.started" && evt.thread_id) {
-        sessionId = evt.thread_id;
-      } else if (
-        evt.type === "item.completed" &&
-        evt.item?.type === "agent_message" &&
-        typeof evt.item.text === "string"
-      ) {
-        messages.push(evt.item.text);
-      } else if (evt.type === "turn.failed" || evt.type === "error") {
-        errored = true;
-      }
-    } catch {
-      // 跳过非 JSON 行（codex 偶尔混入普通日志）
-    }
+/** 去掉 codex 命令外层的 `/bin/zsh -lc '...'` 包裹，显示真实命令 */
+function stripShell(command: string): string {
+  const quoted = command.match(/-l?c\s+'([\s\S]*)'\s*$/) ?? command.match(/-l?c\s+"([\s\S]*)"\s*$/);
+  if (quoted) {
+    return quoted[1].trim();
   }
+  const unquoted = command.match(/\s-l?c\s+([\s\S]*)$/);
+  return (unquoted ? unquoted[1] : command).trim();
+}
 
-  return { text: messages.join("\n\n"), sessionId, errored };
+function shorten(value: string, maxLength: number): string {
+  const oneLine = value.replace(/\s+/g, " ").trim();
+  return oneLine.length <= maxLength ? oneLine : `${oneLine.slice(0, maxLength - 1)}…`;
 }
 
 function buildFreshPrompt(message: string, workspaceDir: string): string {
   return [
     "你是 Telegram 群里的开发助手 Codex，用中文自然地和用户对话，像同事一样直接、简洁。",
     `当前工作目录：${workspaceDir}`,
-    "可以按需读取文件、运行只读命令来理解项目（首次接触某项目时先看 README / AGENTS.md）。",
-    "默认只做分析、解释和回答；只有当用户明确要求“实现 / 修改 / 修复 / 新增 / 重构”时，才改代码，并保持最小改动、完成后简要说明改了什么、有什么风险。",
-    "回复直接给结论，不要罗列无关的命令回显或冗长日志。",
+    "可以按需读取文件、运行命令、读写本地文件来理解和推进任务（首次接触某项目时先看 README / AGENTS.md）。",
+    "",
+    "【主动推进】如果是多步骤/较重的任务，请一次性把它做完：自己规划步骤并连续执行（读文件 → 改代码 → 跑测试/构建 → 修正），不要做一步就停下来等我确认。只有遇到真正需要我拍板的岔路（不可逆操作、需求二义、缺少关键信息）才停下来问我，并说清楚卡在哪、需要我决定什么。",
+    "【改代码原则】默认只做分析与回答；只有用户明确要求“实现/修改/修复/新增/重构”时才改代码，保持最小改动，完成后说明改了什么、跑了哪些验证、有什么风险。",
+    "【汇报】最后用要点汇报：做了什么、结果如何、还有什么待办或风险。回复直接给结论，不要贴大段命令回显。",
     "",
     "用户消息：",
     message,

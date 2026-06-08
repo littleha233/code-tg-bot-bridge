@@ -216,33 +216,30 @@ async function processCodexMessage(
   });
 
   busyChats.add(info.chatId);
-  const ack = await ctx.reply("🐾 收到，正在处理…").catch(() => null);
-  await ctx.replyWithChatAction("typing").catch(() => {});
-  const typingTimer = setInterval(() => {
-    ctx.replyWithChatAction("typing").catch(() => {});
-  }, 5000);
+
+  // 进度面板：实时编辑同一条消息，展示 cx 正在做的步骤，方便监督
+  const progress = new ProgressReporter(ctx, info.chatId);
+  await progress.start();
 
   try {
     const existingSession = sessionStore.get(info.chatId);
-    let result = await codexRunner.run({
-      message,
-      workspaceDir,
-      model,
-      sessionId: existingSession,
-      taskId: task.id,
-    });
+    const runOnce = (sessionId: string | undefined) =>
+      codexRunner.run({
+        message,
+        workspaceDir,
+        model,
+        sessionId,
+        taskId: task.id,
+        onProgress: (step) => progress.push(step),
+      });
+
+    let result = await runOnce(existingSession);
 
     // 续接失败（会话过期等）→ 清掉旧会话，用新会话重试一次
     if (!result.ok && existingSession) {
       logger.warn("Resume likely failed, retrying with a fresh session", { chatId: info.chatId });
       sessionStore.clear(info.chatId);
-      result = await codexRunner.run({
-        message,
-        workspaceDir,
-        model,
-        sessionId: undefined,
-        taskId: task.id,
-      });
+      result = await runOnce(undefined);
     }
 
     if (result.sessionId) {
@@ -254,9 +251,7 @@ async function processCodexMessage(
     task.executionNotes = truncateText(result.text, 2000);
     await taskStore.updateTask(task);
 
-    if (ack) {
-      await ctx.telegram.deleteMessage(Number(info.chatId), ack.message_id).catch(() => {});
-    }
+    await progress.finish(result.ok);
     await replyLong(ctx, result.text);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -264,13 +259,113 @@ async function processCodexMessage(
     task.executionNotes = `执行异常：${errorMessage}`;
     await taskStore.updateTask(task);
     logger.error("Codex run failed", { taskId: task.id, message: errorMessage });
-    if (ack) {
-      await ctx.telegram.deleteMessage(Number(info.chatId), ack.message_id).catch(() => {});
-    }
+    await progress.fail();
     await replyLong(ctx, `处理失败：${errorMessage}`);
   } finally {
-    clearInterval(typingTimer);
+    progress.stop();
     busyChats.delete(info.chatId);
+  }
+}
+
+/** 进度面板：把 codex 的执行步骤实时编辑进同一条 Telegram 消息（节流 2.5s） */
+class ProgressReporter {
+  private steps: string[] = [];
+  private messageId?: number;
+  private lastRendered = "";
+  private dirty = false;
+  private timer?: ReturnType<typeof setInterval>;
+
+  constructor(
+    private readonly ctx: Context,
+    private readonly chatId: string,
+  ) {}
+
+  async start(): Promise<void> {
+    const initial = "🛠 cx 处理中…";
+    const msg = await this.ctx.reply(initial).catch(() => null);
+    this.messageId = msg?.message_id;
+    this.lastRendered = initial;
+    this.timer = setInterval(() => {
+      void this.flush();
+    }, 2500);
+    await this.ctx.replyWithChatAction("typing").catch(() => {});
+  }
+
+  push(step: string): void {
+    this.steps.push(step);
+    this.dirty = true;
+  }
+
+  private render(): string {
+    const shown = this.steps.slice(-20);
+    const omitted = this.steps.length - shown.length;
+    const lines = ["🛠 cx 处理中…"];
+    if (omitted > 0) {
+      lines.push(`…（前 ${omitted} 步略）`);
+    }
+    shown.forEach((step, index) => lines.push(`${omitted + index + 1}. ${step}`));
+    return lines.join("\n").slice(0, 3500);
+  }
+
+  private async flush(): Promise<void> {
+    if (!this.dirty || !this.messageId) {
+      return;
+    }
+    const text = this.render();
+    this.dirty = false;
+    if (text === this.lastRendered) {
+      return;
+    }
+    this.lastRendered = text;
+    await this.ctx.telegram
+      .editMessageText(Number(this.chatId), this.messageId, undefined, text)
+      .catch(() => {});
+  }
+
+  async finish(ok: boolean): Promise<void> {
+    this.stop();
+    if (!this.messageId) {
+      return;
+    }
+    // 纯问答没有步骤 → 删掉进度消息保持干净
+    if (this.steps.length === 0) {
+      await this.ctx.telegram.deleteMessage(Number(this.chatId), this.messageId).catch(() => {});
+      return;
+    }
+    const tailCount = Math.min(8, this.steps.length);
+    const startIndex = this.steps.length - tailCount;
+    const tail = this.steps
+      .slice(startIndex)
+      .map((step, index) => `${startIndex + index + 1}. ${step}`);
+    const head = ok
+      ? `✅ cx 完成（共 ${this.steps.length} 步）`
+      : `⚠️ cx 结束（共 ${this.steps.length} 步，未完全成功）`;
+    const text = [head, ...tail].join("\n").slice(0, 3500);
+    await this.ctx.telegram
+      .editMessageText(Number(this.chatId), this.messageId, undefined, text)
+      .catch(() => {});
+  }
+
+  async fail(): Promise<void> {
+    this.stop();
+    if (!this.messageId) {
+      return;
+    }
+    await this.ctx.telegram
+      .editMessageText(
+        Number(this.chatId),
+        this.messageId,
+        undefined,
+        `❌ cx 处理失败（共 ${this.steps.length} 步）`,
+      )
+      .catch(() => {});
+  }
+
+  stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
   }
 }
 
