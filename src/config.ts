@@ -31,6 +31,12 @@ const envSchema = z.object({
     .string()
     .optional()
     .transform((value) => value?.trim() || undefined),
+  // 默认解除 codex 沙箱与审批，让 cx 像本机/客户端一样自由读写本地（含 .git）。
+  // 设为 false 可恢复沙箱（仅 workspace-write、.git 只读）。
+  CODEX_DANGEROUS_BYPASS: z
+    .string()
+    .default("true")
+    .transform((value) => value.trim().toLowerCase() !== "false"),
   CODEX_TIMEOUT_MS: z
     .string()
     .default("120000")
@@ -59,6 +65,7 @@ export interface AppConfig {
   telegramProxyUrl?: string;
   codexBin: string;
   codexModel?: string;
+  codexBypassSandbox: boolean;
   codexTimeoutMs: number;
   projectRootDir: string;
   tasksDir: string;
@@ -92,6 +99,7 @@ export function loadConfig(): AppConfig {
       undefined,
     codexBin: parsed.CODEX_BIN,
     codexModel: parsed.CODEX_MODEL,
+    codexBypassSandbox: parsed.CODEX_DANGEROUS_BYPASS,
     codexTimeoutMs: parsed.CODEX_TIMEOUT_MS,
     projectRootDir,
     tasksDir: path.join(projectRootDir, "tasks"),

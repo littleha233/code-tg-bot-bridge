@@ -45,15 +45,21 @@ export class CodexRunner {
     const logPrefix = `${taskId}-${Date.now()}`;
     await writeFile(path.join(this.config.logsDir, `${logPrefix}.prompt.md`), input, "utf8");
 
+    // 默认解除沙箱与审批，让 cx 像本机/客户端一样自由读写本地（含 .git、切分支、提交）。
+    const accessFlags = this.config.codexBypassSandbox
+      ? ["--dangerously-bypass-approvals-and-sandbox"]
+      : [];
+
     const args = sessionId
-      ? ["exec", "resume", sessionId, "--skip-git-repo-check", "--json", "-"]
-      : ["exec", "--skip-git-repo-check", ...(model ? ["--model", model] : []), "--json", "-"];
+      ? ["exec", "resume", sessionId, "--skip-git-repo-check", ...accessFlags, "--json", "-"]
+      : ["exec", "--skip-git-repo-check", ...accessFlags, ...(model ? ["--model", model] : []), "--json", "-"];
 
     logger.info("Running codex exec", {
       taskId,
       workspace: workspaceDir,
       resume: Boolean(sessionId),
       model: model ?? "(codex 默认)",
+      bypassSandbox: this.config.codexBypassSandbox,
     });
 
     const result = await execa(this.config.codexBin, args, {
