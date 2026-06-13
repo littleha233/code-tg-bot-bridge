@@ -10,6 +10,8 @@ const logger = createLogger("sessionStore");
  */
 export class SessionStore {
   private sessions: Record<string, string> = {};
+  // 压缩后的上下文摘要（内存即可）：下次开新会话时作为背景注入
+  private seeds: Record<string, string> = {};
 
   constructor(private readonly filePath: string) {
     try {
@@ -31,6 +33,18 @@ export class SessionStore {
   clear(chatId: string): void {
     delete this.sessions[chatId];
     this.persist();
+  }
+
+  getPendingSeed(chatId: string): string | undefined {
+    return this.seeds[chatId];
+  }
+
+  setPendingSeed(chatId: string, seed: string): void {
+    this.seeds[chatId] = seed;
+  }
+
+  clearPendingSeed(chatId: string): void {
+    delete this.seeds[chatId];
   }
 
   private persist(): void {

@@ -1,10 +1,18 @@
 import type { Context, Telegraf } from "telegraf";
 import { isAuthorized } from "./auth";
+import { CodexRunner } from "./codexRunner";
 import type { AppConfig } from "./config";
 import type { ModelStore } from "./modelStore";
 import type { SessionStore } from "./sessionStore";
 import { TaskStore } from "./taskStore";
+import { splitMessageByLength } from "./text";
 import type { WorkspaceStore } from "./workspaceStore";
+
+// 让 codex 把当前会话浓缩成上下文摘要
+const COMPACT_PROMPT =
+  "请把我们到目前为止的对话和你做过的工作，浓缩成一份简洁但完整的「上下文摘要」，" +
+  "供开启新会话时作为背景。包含：核心目标/任务、关键决策与结论、当前进度与状态、" +
+  "待办事项、涉及的重要文件与路径、需要遵守的约定。只输出摘要本身，不要寒暄或多余解释。";
 
 export function registerCommandHandlers(
   bot: Telegraf,
@@ -13,6 +21,7 @@ export function registerCommandHandlers(
   modelStore: ModelStore,
   workspaceStore: WorkspaceStore,
   sessionStore: SessionStore,
+  codexRunner: CodexRunner,
 ): void {
   const helpText = buildHelpText();
 
@@ -24,6 +33,48 @@ export function registerCommandHandlers(
     }
     sessionStore.clear(chatId);
     await ctx.reply("🆕 已开启新会话，之前的对话上下文已清空。");
+  });
+
+  // /cxcompact：压缩上下文——生成摘要后清空长历史，摘要作为新会话背景
+  bot.command("cxcompact", async (ctx) => {
+    const userId = String(ctx.from?.id ?? "");
+    const chatId = String(ctx.chat?.id ?? "");
+    if (!isAuthorized(config, { userId, chatId })) {
+      return;
+    }
+    const sessionId = sessionStore.get(chatId);
+    if (!sessionId) {
+      await ctx.reply("ℹ️ 当前没有进行中的会话，无需压缩（直接用 /cxnew 即可）。");
+      return;
+    }
+    const note = await ctx.reply("🗜 正在压缩上下文（生成摘要中，可能要十几秒）…").catch(() => null);
+    try {
+      const result = await codexRunner.run({
+        message: COMPACT_PROMPT,
+        workspaceDir: workspaceStore.get(chatId, config.codexWorkspaceDir),
+        model: modelStore.get(chatId, config.codexModel),
+        sessionId,
+        taskId: `COMPACT-${Date.now()}`,
+      });
+      if (note) {
+        await ctx.telegram.deleteMessage(Number(chatId), note.message_id).catch(() => {});
+      }
+      if (!result.ok || !result.text.trim()) {
+        await ctx.reply("❌ 生成摘要失败，请稍后再试。");
+        return;
+      }
+      sessionStore.clear(chatId);
+      sessionStore.setPendingSeed(chatId, result.text.trim());
+      const reply = `✅ 已压缩上下文：旧的长历史已清空，下面这份摘要会作为新会话的背景。\n\n📋 摘要：\n${result.text.trim()}`;
+      for (const chunk of splitMessageByLength(reply, 3500)) {
+        await ctx.reply(chunk);
+      }
+    } catch (error) {
+      if (note) {
+        await ctx.telegram.deleteMessage(Number(chatId), note.message_id).catch(() => {});
+      }
+      await ctx.reply(`❌ 压缩失败：${error instanceof Error ? error.message : String(error)}`);
+    }
   });
 
   bot.command(["start", "cxhelp"], async (ctx) => {
@@ -157,6 +208,7 @@ export async function registerCommandMenu(bot: Telegraf): Promise<void> {
   await bot.telegram.setMyCommands([
     { command: "cxhelp", description: "查看自然语言用法和辅助命令" },
     { command: "cxnew", description: "清空对话上下文、开新会话" },
+    { command: "cxcompact", description: "压缩上下文（生成摘要、省 token）" },
     { command: "cxproject", description: "切换工作目录；不带参数查看当前" },
     { command: "cxmodel", description: "切换 codex 模型；不带参数查看当前" },
     { command: "cxwhoami", description: "查看 user_id 和 chat_id" },
@@ -178,6 +230,7 @@ function buildHelpText(): string {
     "",
     "辅助命令：",
     "· /cxnew 清空上下文、开新会话",
+    "· /cxcompact 压缩上下文（生成摘要、省 token、保留主线）",
     "· /cxproject <路径> 切换工作目录；不带参数查看当前",
     "· /cxmodel <模型> 切换 codex 模型；不带参数查看当前",
     "· /cxwhoami 查看 user_id 和 chat_id",

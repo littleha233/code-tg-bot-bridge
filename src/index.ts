@@ -37,7 +37,7 @@ async function main(): Promise<void> {
   const codexRunner = new CodexRunner(config);
 
   await registerCommandMenu(bot);
-  registerCommandHandlers(bot, config, taskStore, modelStore, workspaceStore, sessionStore);
+  registerCommandHandlers(bot, config, taskStore, modelStore, workspaceStore, sessionStore, codexRunner);
   registerMessageHandler(
     bot,
     config,

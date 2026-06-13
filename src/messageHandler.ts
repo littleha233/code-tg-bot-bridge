@@ -226,9 +226,20 @@ async function processCodexMessage(
 
   try {
     const existingSession = sessionStore.get(info.chatId);
+
+    // 开新会话且有压缩摘要 → 把摘要作为背景注入第一条消息
+    let effectiveMessage = message;
+    if (!existingSession) {
+      const seed = sessionStore.getPendingSeed(info.chatId);
+      if (seed) {
+        effectiveMessage = `【上一段对话的上下文摘要，请作为背景记住】\n${seed}\n\n【用户新消息】\n${message}`;
+        sessionStore.clearPendingSeed(info.chatId);
+      }
+    }
+
     const runOnce = (sessionId: string | undefined) =>
       codexRunner.run({
-        message,
+        message: effectiveMessage,
         workspaceDir,
         model,
         sessionId,
