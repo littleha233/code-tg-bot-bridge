@@ -11,7 +11,8 @@ import { createLogger } from "./logger";
 import type { ModelStore } from "./modelStore";
 import type { SessionStore } from "./sessionStore";
 import { TaskStore } from "./taskStore";
-import { splitMessageByLength, truncateText } from "./text";
+import { truncateText } from "./text";
+import { mdToTelegramHtml, stripMarkdown, chunkByLine } from "./telegramFormat";
 import type { WorkspaceStore } from "./workspaceStore";
 import type { Telegraf, Context } from "telegraf";
 
@@ -267,12 +268,20 @@ async function processCodexMessage(
 
     await progress.finish(result.ok);
     const { text: cleaned, files } = extractAttachments(result.text);
-    if (cleaned) {
-      await replyLong(ctx, cleaned);
-    } else if (files.length === 0) {
-      await replyLong(ctx, result.text || "(空)");
+    // 回复投递单独兜底：codex 已算完，若只是代理抖动导致发不出去，
+    // 不能让进度面板假装"处理中"，要如实告知发送失败（结果在日志里）。
+    try {
+      if (cleaned) {
+        await replyLong(ctx, cleaned);
+      } else if (files.length === 0) {
+        await replyLong(ctx, result.text || "(空)");
+      }
+      await sendAttachments(ctx, files);
+    } catch (deliveryError) {
+      const msg = deliveryError instanceof Error ? deliveryError.message : String(deliveryError);
+      logger.error("Reply delivery failed after retries", { taskId: task.id, message: msg });
+      await progress.deliveryFailed();
     }
-    await sendAttachments(ctx, files);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     task.status = "failed";
@@ -381,6 +390,22 @@ class ProgressReporter {
       .catch(() => {});
   }
 
+  /** codex 已完成、但回复发不出去（多为代理抖动）：如实告知，别假装"处理中" */
+  async deliveryFailed(): Promise<void> {
+    this.stop();
+    if (!this.messageId) {
+      return;
+    }
+    await this.ctx.telegram
+      .editMessageText(
+        Number(this.chatId),
+        this.messageId,
+        undefined,
+        `⚠️ cx 已完成，但回复发送失败（网络/代理抖动）。结果已写入日志，可重发上一条消息再试。`,
+      )
+      .catch(() => {});
+  }
+
   stop(): void {
     if (this.timer) {
       clearInterval(this.timer);
@@ -419,26 +444,67 @@ async function sendAttachments(ctx: Context, files: string[]): Promise<void> {
   for (const file of files) {
     const ext = (file.match(/\.[^./]+$/)?.[0] ?? "").toLowerCase();
     try {
-      if (IMAGE_EXT.has(ext)) {
-        await ctx.replyWithPhoto({ source: file });
-      } else {
-        await ctx.replyWithDocument({ source: file });
-      }
-    } catch (error) {
-      await ctx.reply(
-        `⚠️ 上传文件失败 ${path.basename(file)}：${error instanceof Error ? error.message : String(error)}`,
+      await tgRetry<unknown>(() =>
+        IMAGE_EXT.has(ext)
+          ? ctx.replyWithPhoto({ source: file })
+          : ctx.replyWithDocument({ source: file }),
       );
+    } catch (error) {
+      await ctx
+        .reply(
+          `⚠️ 上传文件失败 ${path.basename(file)}：${error instanceof Error ? error.message : String(error)}`,
+        )
+        .catch(() => {});
     }
   }
 }
 
 async function replyLong(ctx: Context, text: string): Promise<void> {
   const replyToId = (ctx.message as { message_id?: number } | undefined)?.message_id;
-  const chunks = splitMessageByLength(text, 3500);
+  const replyExtra = replyToId ? { reply_parameters: { message_id: replyToId } } : {};
+  // 常见短回复整条发；超长才按源码行切，保证每段 HTML 标签自洽
+  const chunks = mdToTelegramHtml(text).length <= 3900 ? [text] : chunkByLine(text, 3200);
   for (const chunk of chunks) {
-    await ctx.reply(
-      chunk,
-      replyToId ? { reply_parameters: { message_id: replyToId } } : undefined,
-    );
+    const html = mdToTelegramHtml(chunk);
+    if (!html) continue;
+    try {
+      // HTML 发送带网络重试：代理 TLS 抖动时不至于让回复石沉大海
+      await tgRetry(() =>
+        ctx.reply(html, {
+          parse_mode: "HTML",
+          link_preview_options: { is_disabled: true },
+          ...replyExtra,
+        }),
+      );
+    } catch (error) {
+      const m = error instanceof Error ? error.message : String(error);
+      // 解析类失败（HTML 转换边角）→ 退回纯文本，别误判成投递失败
+      if (/parse entities|can't parse|Bad Request/i.test(m)) {
+        logger.warn("HTML 渲染被 Telegram 拒绝，退回纯文本", { message: m });
+        await tgRetry(() => ctx.reply(stripMarkdown(chunk), replyExtra));
+      } else {
+        throw error; // 网络类失败 → 交给上层 deliveryFailed 兜底
+      }
+    }
   }
+}
+
+/**
+ * 给 Telegram 调用加重试 + 退避。主要应对代理（FlyingBird 7892）偶发
+ * "Client network socket disconnected before secure TLS connection" 之类的瞬断。
+ * 重试用尽仍失败才抛出，交由上层决定如何兜底。
+ */
+async function tgRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+  let lastError: unknown;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (i < attempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 800 * (i + 1)));
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }

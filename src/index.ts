@@ -29,6 +29,9 @@ async function main(): Promise<void> {
 
   const bot = new Telegraf(config.telegramBotToken, {
     telegram: buildTelegramOptions(config.telegramProxyUrl),
+    // codex 重任务普遍 >90s（Telegraf 默认 handlerTimeout），调到比 codex 超时还长，
+    // 避免满屏 "Promise timed out after 90000 ms" 噪音、也不让 Telegraf 中途放弃 handler。
+    handlerTimeout: config.codexTimeoutMs + 120000,
   });
 
   logger.info("Fetching bot identity from Telegram");
