@@ -67,6 +67,16 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// 消息里是否显式 @ 了"另一个 bot"（Telegram bot 用户名必以 bot 结尾，可精准识别、不误伤真人）。
+function mentionsOtherBot(text: string, selfUsername: string | undefined): boolean {
+  const self = (selfUsername ?? "").toLowerCase();
+  const mentions = text.match(/@([a-z0-9_]+)/gi) ?? [];
+  return mentions.some((m) => {
+    const u = m.slice(1).toLowerCase();
+    return u.endsWith("bot") && u !== self;
+  });
+}
+
 function truncateText(value: string, maxLength = 120): string {
   if (value.length <= maxLength) {
     return value;
@@ -94,7 +104,9 @@ export function detectTrigger(
     };
   }
 
-  if (isReplyToBot) {
+  // 回复本 bot 即视为在叫我——但若消息里显式 @ 了别的 bot，则让位（用户在指派那个 bot，
+  // 回复我只是引用上下文）。此时不走这条捷径，交给下面的"开头触发词/@我"显式判定。
+  if (isReplyToBot && !mentionsOtherBot(sourceText, botUsername)) {
     return {
       shouldProcess: true,
       cleanedText: stripTriggers(sourceText, botUsername, triggerNames),
